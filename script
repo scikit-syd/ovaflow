@@ -1,0 +1,166 @@
+import os
+import numpy as np
+from PIL import Image
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.metrics import roc_auc_score, roc_curve
+import matplotlib.pyplot as plt
+import mlflow
+import mlflow.keras
+
+#LABEL ENCODER
+label_encoder = {
+    "noninfected": 0,
+    "infected":    1,
+    0: 0,
+    1: 2,
+    2: 2,
+    3: 2,
+    4: 2,
+    5: 0,
+    6: 2,
+    7: 2,
+}
+
+#LOAD MMOTU
+mmotu_class_1 = pd.read_csv("train_cls.txt", header=None, names=["image", "class"], sep=r"\s+") #insert file path
+mmotu_class_2 = pd.read_csv("val_cls.txt",   header=None, names=["image", "class"], sep=r"\s+") #insert file path
+label_map = dict(zip(
+    pd.concat([mmotu_class_1, mmotu_class_2])["image"],
+    pd.concat([mmotu_class_1, mmotu_class_2])["class"]
+))
+
+mmotu_dir = "images" #insert file path
+mmotu_data, mmotu_labels = [], []
+
+for image_file in os.listdir(mmotu_dir):
+    if image_file.upper().endswith(".JPG"):
+        if image_file not in label_map:
+            print(f"No label found for {image_file}")
+            continue
+        img = Image.open(os.path.join(mmotu_dir, image_file)).resize((256, 256)).convert("RGB")
+        img_array = preprocess_input(np.array(img, dtype="float32"))
+        mmotu_data.append(img_array)
+        mmotu_labels.append(label_map[image_file])
+
+#LOAD PCOS
+pcos_dirs = {
+    "infected":    "infected", #insert file path
+    "noninfected": "noninfected" #insert file path
+}
+pcos_data, pcos_labels = [], []
+
+for class_name, dir_path in pcos_dirs.items():
+    for img_name in os.listdir(dir_path):
+        if not img_name.lower().endswith(".jpg"):
+            continue
+        img = Image.open(os.path.join(dir_path, img_name)).resize((256, 256)).convert("RGB")
+        img_array = preprocess_input(np.array(img, dtype="float32"))
+        pcos_data.append(img_array)
+        pcos_labels.append(class_name)
+
+#MERGE + ENCODE + SPLIT
+all_images = np.array(pcos_data + mmotu_data)
+all_labels = np.array([label_encoder[l] for l in pcos_labels + mmotu_labels])
+
+x_trainval, x_test, y_trainval, y_test = train_test_split(
+    all_images, all_labels, test_size=0.15, stratify=all_labels, random_state=42
+)
+x_train, x_val, y_train, y_val = train_test_split(
+    x_trainval, y_trainval, test_size=0.15/0.85, stratify=y_trainval, random_state=42
+)
+
+#RESNET50 MODEL
+def build_model():
+    inputs = layers.Input(shape=(256, 256, 3))
+    base = keras.applications.ResNet50(
+        input_shape=(256, 256, 3), include_top=False, weights="imagenet"
+    )(inputs)
+    x = layers.GlobalAveragePooling2D()(base)
+    x = layers.Dense(1024, activation="relu")(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(512, activation="relu")(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(3, activation="softmax")(x)
+    model = keras.Model(inputs, outputs)
+    model.compile(
+        optimizer="adam",
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+    return model
+
+model = build_model()
+
+#BALANCE CLASS WEIGHTS
+weights = compute_class_weight(
+    class_weight="balanced",
+    classes=np.array([0, 1, 2]),
+    y=y_train
+)
+class_weights = dict(enumerate(weights))
+
+#FIT MODEL WITH EARLY STOPPING
+early_stopping = keras.callbacks.EarlyStopping(
+    monitor="val_loss",
+    patience=5,
+    restore_best_weights=True
+)
+
+model.fit(
+    x_train, y_train,
+    validation_data=(x_val, y_val),
+    epochs=50,
+    class_weight=class_weights,
+    callbacks=[early_stopping],
+)
+
+# EVALUATION
+print("Validation Accuracy:", model.evaluate(x_val, y_val)[1])
+print("Test Accuracy:", model.evaluate(x_test, y_test)[1])
+
+#AUC SCORE APPROVAL GATE
+y_probs = model.predict(x_test)
+y_pred = np.argmax(y_probs, axis=1)
+y_true = y_test
+
+# Compute AUC
+auc_score = roc_auc_score(
+    y_true, y_probs,
+    multi_class="ovr",
+    average="macro"
+)
+print(f"AUC Score: {auc_score:.4f}")
+
+# Approval gate
+AUC_THRESHOLD = 0.85
+
+with mlflow.start_run():
+    mlflow.log_param("epochs",        50)
+    mlflow.log_param("batch_size",    32)
+    mlflow.log_param("optimizer",     "adam")
+    mlflow.log_param("class_weights", str(class_weights))
+    mlflow.log_metric("auc_score",    auc_score)
+
+    if auc_score >= AUC_THRESHOLD:
+        print(f"PASS — AUC {auc_score:.4f} meets threshold {AUC_THRESHOLD}")
+        mlflow.keras.log_model(model, "ovaflow_model")
+        print("Model registered in MLflow.")
+    else:
+        print(f"FAIL — AUC {auc_score:.4f} below threshold {AUC_THRESHOLD}")
+        print("Adjust hyperparameters and resubmit the SLURM job.")
+
+#ROC CURVE PLOT
+fpr, tpr, thresholds = roc_curve(y_true, y_probs)
+plt.plot(fpr, tpr, label=f'ROC curve (area = {auc_score:.2f})')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('OvaFlow ROC Curve')
+plt.legend(loc="lower right")
+plt.show()
